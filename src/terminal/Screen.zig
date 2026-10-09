@@ -3453,6 +3453,51 @@ pub fn selectOutput(self: *Screen, pin: Pin) ?Selection {
     return .init(hl.start, hl.end, false);
 }
 
+/// The input (command line) and output selections of the most recent
+/// prompt on the screen, as determined by shell integration.
+pub const CommandBlock = struct {
+    /// The text the user entered. Null if there was no input.
+    input: ?Selection,
+
+    /// The command output with trailing whitespace trimmed. Null if the
+    /// command printed nothing.
+    output: ?Selection,
+};
+
+/// Returns the most recent command block on the screen, or null if no
+/// semantic prompt has been seen. This is meant to be called when a
+/// command finishes (OSC 133;D), at which point the most recent prompt
+/// is the one that owns the command that just completed.
+pub fn lastCommandBlock(self: *Screen) ?CommandBlock {
+    const bottom = self.pages.getBottomRight(.screen) orelse return null;
+    var it = bottom.promptIterator(.left_up, null);
+    const prompt_pin = it.next() orelse return null;
+
+    const input: ?Selection = if (self.pages.highlightSemanticContent(
+        prompt_pin,
+        .input,
+    )) |hl| .init(hl.start, hl.end, false) else null;
+
+    const output: ?Selection = output: {
+        var hl = self.pages.highlightSemanticContent(
+            prompt_pin,
+            .output,
+        ) orelse break :output null;
+
+        // Trim our trailing whitespace
+        var cell_it = hl.end.cellIterator(.left_up, hl.start);
+        while (cell_it.next()) |p| {
+            const cell = p.rowAndCell().cell;
+            hl.end = p;
+            if (cell.hasText()) break;
+        }
+
+        break :output .init(hl.start, hl.end, false);
+    };
+
+    return .{ .input = input, .output = output };
+}
+
 pub const LineIterator = struct {
     screen: *const Screen,
     current: ?Pin = null,
@@ -10658,6 +10703,59 @@ test "Screen: selectWord with character boundary" {
                 .y = 0,
             } }, s.pages.pointFromPin(.screen, sel.end()).?);
         }
+    }
+}
+
+test "Screen: lastCommandBlock" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 15, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // No prompt seen yet.
+    try testing.expect(s.lastCommandBlock() == null);
+
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("ls -la\n");
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("file1\nfile2\n");
+    s.cursorSetSemanticContent(.{ .prompt = .initial });
+    try s.testWriteString("$ ");
+    s.cursorSetSemanticContent(.{ .input = .clear_explicit });
+    try s.testWriteString("true\n");
+
+    // The most recent command has input but no output.
+    {
+        const block = s.lastCommandBlock().?;
+        var input = block.input.?;
+        defer input.deinit(&s);
+        const text = try s.selectionString(alloc, .{ .sel = input, .trim = false });
+        defer alloc.free(text);
+        try testing.expectEqualStrings("true", text);
+        try testing.expect(block.output == null);
+    }
+
+    // Finish it with output, then confirm we get the latest block whole.
+    s.cursorSetSemanticContent(.output);
+    try s.testWriteString("done\n");
+    {
+        const block = s.lastCommandBlock().?;
+        var input = block.input.?;
+        defer input.deinit(&s);
+        var output = block.output.?;
+        defer output.deinit(&s);
+
+        const in_text = try s.selectionString(alloc, .{ .sel = input, .trim = false });
+        defer alloc.free(in_text);
+        try testing.expectEqualStrings("true", in_text);
+
+        const out_text = try s.selectionString(alloc, .{ .sel = output, .trim = false });
+        defer alloc.free(out_text);
+        try testing.expectEqualStrings("done", out_text);
     }
 }
 

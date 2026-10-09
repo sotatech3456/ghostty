@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const global = @import("../global.zig");
 const xev = global.xev;
 const apprt = @import("../apprt.zig");
+const command_log = @import("../command_log.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
 const internal_os = @import("../os/main.zig");
@@ -92,6 +93,10 @@ pub const StreamHandler = struct {
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
+
+    /// When the current command started running (OSC 133;C), used to time
+    /// it for the structured command log.
+    command_started: ?std.Io.Timestamp = null,
 
     pub const Stream = terminal.Stream(StreamHandler);
 
@@ -1463,6 +1468,7 @@ pub const StreamHandler = struct {
     ) !void {
         switch (cmd.action) {
             .end_input_start_output => {
+                self.command_started = .now(global.io(), .awake);
                 self.surfaceMessageWriter(.start_command);
             },
 
@@ -1474,6 +1480,11 @@ pub const StreamHandler = struct {
                     const raw: i32 = cmd.readOption(.exit_code) orelse 0;
                     break :code std.math.cast(u8, raw) orelse 1;
                 };
+
+                // Log before the terminal sees the next prompt (which
+                // normally follows immediately) so the most recent prompt
+                // is still the one that owns this command.
+                self.logFinishedCommand(code);
 
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
@@ -1491,6 +1502,92 @@ pub const StreamHandler = struct {
         // We do this last so failures are still processed correctly
         // above.
         try self.terminal.semanticPrompt(cmd);
+    }
+
+    /// Where finished commands are logged as JSONL. `GHOSTTY_COMMAND_LOG`
+    /// can name another file, or be "off" to disable logging. Returns null
+    /// when logging is disabled or no location can be determined.
+    fn commandLogPath(alloc: Allocator) ?[:0]u8 {
+        if (global.environ().getAlloc(alloc, "GHOSTTY_COMMAND_LOG")) |v| {
+            defer alloc.free(v);
+            if (v.len == 0 or std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0")) return null;
+            return alloc.dupeZ(u8, v) catch null;
+        } else |_| {}
+
+        const home = global.environ().getAlloc(alloc, "HOME") catch return null;
+        defer alloc.free(home);
+        return std.fmt.allocPrintSentinel(
+            alloc,
+            "{s}/.local/share/termdata/ghostty.jsonl",
+            .{home},
+            0,
+        ) catch null;
+    }
+
+    /// Append a structured record (command line, output, cwd, exit code,
+    /// duration) for the command that just finished. Best effort: failures
+    /// are logged and otherwise ignored so they can never affect the
+    /// terminal. We run on the IO thread with the terminal already locked.
+    fn logFinishedCommand(self: *StreamHandler, exit_code: ?u8) void {
+        const alloc = self.alloc;
+        const path = commandLogPath(alloc) orelse return;
+        defer alloc.free(path);
+
+        const screen = self.terminal.screens.active;
+        const block = screen.lastCommandBlock() orelse return;
+
+        var input_text: ?[:0]const u8 = null;
+        var output_text: ?[:0]const u8 = null;
+        defer {
+            if (input_text) |v| alloc.free(v);
+            if (output_text) |v| alloc.free(v);
+        }
+        if (block.input) |sel| {
+            var s = sel;
+            defer s.deinit(screen);
+            input_text = screen.selectionString(alloc, .{ .sel = s, .trim = false }) catch null;
+        }
+        if (block.output) |sel| {
+            var s = sel;
+            defer s.deinit(screen);
+            output_text = screen.selectionString(alloc, .{ .sel = s, .trim = false }) catch null;
+        }
+
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const host = std.posix.gethostname(&host_buf) catch "unknown";
+
+        // The shell redraws lines with blanks, so drop trailing whitespace
+        // before measuring and cutting.
+        const out_cut: struct { []const u8, bool } = if (output_text) |o|
+            command_log.truncate(command_log.trimEnd(o), command_log.max_output_bytes)
+        else
+            .{ "", false };
+
+        const duration_ms: u64 = if (self.command_started) |start| ms: {
+            const ns = start.durationTo(.now(global.io(), .awake)).nanoseconds;
+            break :ms @intCast(@max(0, @divFloor(ns, std.time.ns_per_ms)));
+        } else 0;
+        self.command_started = null;
+
+        const now = std.Io.Timestamp.now(global.io(), .real);
+        const line = command_log.formatLine(alloc, .{
+            .ts_ms = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_ms)),
+            .host = host,
+            .cwd = self.terminal.getPwd(),
+            .input = if (input_text) |i| command_log.trimEnd(i) else null,
+            .output = if (output_text != null) out_cut[0] else null,
+            .output_truncated = out_cut[1],
+            .exit_code = exit_code,
+            .duration_ms = duration_ms,
+        }) catch |err| {
+            log.warn("command log: format failed err={}", .{err});
+            return;
+        };
+        defer alloc.free(line);
+
+        command_log.appendLine(global.io(), path, line) catch |err| {
+            log.warn("command log: write failed path={s} err={}", .{ path, err });
+        };
     }
 
     fn reportPwd(self: *StreamHandler, url: []const u8) !void {

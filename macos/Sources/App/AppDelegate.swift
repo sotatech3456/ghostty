@@ -211,6 +211,11 @@ class AppDelegate: NSObject,
         ])
     }
 
+    /// Reload the config when the process receives SIGUSR2 (like the GTK
+    /// app does). `slash night` / `slash day` use this after rewriting the
+    /// config so the change shows up without touching the menu.
+    private var reloadSignalSource: DispatchSourceSignal?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         // System settings overrides
         UserDefaults.ghostty.register(defaults: [
@@ -228,6 +233,16 @@ class AppDelegate: NSObject,
 
         // Initial config loading
         ghosttyConfigDidChange(config: ghostty.config)
+
+        // SIGUSR2 => reload config. The default action would kill us, so it
+        // must be ignored before the dispatch source takes over.
+        signal(SIGUSR2, SIG_IGN)
+        let source = DispatchSource.makeSignalSource(signal: SIGUSR2, queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.ghostty.reloadConfig()
+        }
+        source.resume()
+        reloadSignalSource = source
 
         // Start our update checker.
         updateController.startUpdater()
